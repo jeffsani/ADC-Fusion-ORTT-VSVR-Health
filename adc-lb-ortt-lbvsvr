@@ -1,0 +1,137 @@
+var handler = new OpenmixApplication({
+
+	
+	providers: [{
+		alias: 'aws_ec2_eu_west_1_eu_ireland',
+		host: '1.2.3.4',
+		name: 'AWS EC2 eu-west-1 EU (Ireland)'
+	}, {
+		alias: 'us',
+		host: '5.6.7.8',
+		name: 'GSLB US_34.196.210.162'
+	}],
+
+	availability_threshold: 80
+	
+});
+
+function init(config) {
+	'use strict';
+	handler.do_init(config);
+}
+
+function onRequest(request, response) {
+	'use strict';
+	handler.handle_request(request, response);
+}
+
+/** @constructor */
+function OpenmixApplication(settings) {
+	'use strict';
+
+	this.do_init = function(config) {
+		settings.providers.forEach(p => config.requireProvider(p.alias));
+	};
+
+	this.handle_request = function(request, response) {
+		var reasonCode = null,
+		reasonLogs = [],
+		dataAvail = request.getProbe('avail'),
+		dataRtt = request.getProbe('http_rtt'),
+		dataKbps = request.getProbe('http_kbps'),
+		dataFusion = parseFusionData(request.getData('fusion'), reasonLogs) || [],
+		dataSonar = parseFusionData(request.getData('sonar')) || [],
+		localSettings = JSON.parse(JSON.stringify(settings)),
+
+		allReasons = {
+			all_providers_unavailable: 'all_unavailable',
+			only_one_provider_available: 'only_one_available',
+			sorted_by_ortt: 'sorted_by_ortt'
+		};
+
+		var candidates = localSettings.providers;
+
+		candidates.forEach(c => {
+			c.avail = (c.avail != undefined ? parseInt(c.avail) : (dataAvail != undefined && dataAvail[c.alias] != undefined && dataAvail[c.alias].avail != undefined ? parseInt(dataAvail[c.alias].avail) : undefined));
+			c.http_rtt = (c.http_rtt != undefined ? parseInt(c.http_rtt) : (dataRtt != undefined && dataRtt[c.alias] != undefined && dataRtt[c.alias].http_rtt != undefined ? parseInt(dataRtt[c.alias].http_rtt) : Infinity));
+			c.http_kbps = (c.http_kbps != undefined ? parseInt(c.http_kbps) : (dataKbps != undefined && dataKbps[c.alias] != undefined && dataKbps[c.alias].http_kbps != undefined ? parseInt(dataKbps[c.alias].http_kbps) : -Infinity));
+			c.availability_threshold = (c.availability_threshold != undefined ? parseInt(c.availability_threshold) : (localSettings.availability_threshold != undefined ? parseInt(localSettings.availability_threshold) : undefined));
+			c.sonar = (c.sonar != undefined ? parseInt(c.sonar) : (dataSonar != undefined && dataSonar[c.alias] != undefined && dataSonar[c.alias].avail != undefined ? parseInt(dataSonar[c.alias].avail) : undefined));
+			c.fusion = c.fusion || dataFusion[c.alias];
+			c.unavailable_reasons = [];
+			c.setUnavailable = in_reason => c.unavailable_reasons.push(in_reason);
+			c.isAvailable = () => c.unavailable_reasons.length == 0;
+
+			c.vslbhealth = (c.fusion != undefined && c.fusion.lbvserver != undefined && c.fusion.lbvserver.length > 0 && c.fusion.lbvserver[0].vslbhealth != undefined ? c.fusion.lbvserver[0].vslbhealth : undefined );
+		});
+
+		candidates.getAvailables = () => candidates.filter(c => c.isAvailable() == true);
+
+		candidates.filter(c => c.avail == undefined).forEach(c => c.setUnavailable('missing_radar_availability'));
+		candidates.filter(c => c.avail != undefined && c.avail < c.availability_threshold).forEach(c => c.setUnavailable('under_radar_availability_threshold'));
+		candidates.filter(c => c.sonar != undefined && c.sonar == 0).forEach(c => c.setUnavailable('sonar_saying_unavailable'));
+		candidates.filter(c => c.vslbhealth != "100" ).forEach(c => c.setUnavailable('vslbhealth_not_100'));
+
+		var l_returnedCandidates = [];
+
+		if (candidates.getAvailables().length == 0) {
+			// if no candidates available : nightmare case : use the target distribution on all the providers
+			reasonCode = allReasons.all_providers_unavailable;
+			// lucky players = keep only under availability threshold, then sort by avail desc
+			candidates.filter(c => c.unavailable_reasons.length == 1 && c.unavailable_reasons[0] == 'under_radar_availability_threshold').sort((a,b) => b.avail - a.avail).forEach(c => l_returnedCandidates.push(c));
+
+		} else if (candidates.getAvailables().length == 1) {
+			reasonCode = allReasons.only_one_provider_available;
+			l_returnedCandidates = l_returnedCandidates.concat(candidates.getAvailables());
+		} else {
+			// sort by ortt
+			candidates.getAvailables().sort((a,b) => a.http_rtt - b.http_rtt).forEach(c => l_returnedCandidates.push(c));
+			reasonCode = allReasons.sorted_by_ortt;
+		}
+
+		// return the providers
+		//l_returnedCandidates.forEach(c =>  response.addProviderHost(c.alias, c.host, { 'vslbhealth' : c.vslbhealth}));
+		if ( l_returnedCandidates.length > 0) {
+			//response.respond(l_returnedCandidates[0].alias, l_returnedCandidates[0].host);
+			response.respond(l_returnedCandidates[0].alias, l_returnedCandidates[0].host);
+			
+		}
+		// logs
+		//reasonLogs.push("providers=" + JSON.stringify(candidates));
+		//candidates.forEach(c => reasonLogs.push( c.alias + "-vslbhealth-" + c.vslbhealth) );
+
+		// status and reason code
+		//response.setStatus(200);
+		response.setReasonCode(reasonCode);
+		response.log(reasonLogs.join(', '));
+
+		// Specify the provider alias and CNAME (or IP address)
+    	
+  
+    	// Always set a TTL
+    	response.setTTL(5);
+	}
+
+	function parseFusionData(data, reasonLogs) {
+		if (data != undefined) {
+			var keys = Object.keys(data),
+			i = keys.length,
+			key;
+			while (i--) {
+				key = keys[i];
+				if (key == settings.openmix_decisions) {
+					data[key] = data[key].toString();
+				}
+				try {
+					data[key] = JSON.parse(data[key]);
+				} catch (e) {
+					reasonLogs.push("exception  " + e + " on data : " + data[key]);
+					delete data[key];
+				}
+			}
+		}
+		return data;
+	}
+
+
+}
